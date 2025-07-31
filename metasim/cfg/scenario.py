@@ -78,7 +78,7 @@ class ScenarioCfg:
             if isinstance(robot, str):
                 self.robots[i] = get_robot(robot)
         if isinstance(self.task, str):
-            TaskCls = get_task(self.task)
+            TaskCls = get_task(self.task)()
             ### Instantiate TaskCls with robots if supported
             if "robots" in TaskCls.__dataclass_fields__.keys():
                 self.task = TaskCls(robots=self.robots)

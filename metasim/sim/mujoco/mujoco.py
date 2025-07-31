@@ -7,12 +7,7 @@ import torch
 from dm_control import mjcf
 from loguru import logger as log
 
-from metasim.cfg.objects import (
-    ArticulationObjCfg,
-    PrimitiveCubeCfg,
-    PrimitiveCylinderCfg,
-    PrimitiveSphereCfg,
-)
+from metasim.cfg.objects import ArticulationObjCfg, PrimitiveCubeCfg, PrimitiveCylinderCfg, PrimitiveSphereCfg
 from metasim.cfg.robots import BaseRobotCfg
 from metasim.cfg.scenario import ScenarioCfg
 from metasim.constants import TaskType
@@ -20,6 +15,8 @@ from metasim.sim import BaseSimHandler, EnvWrapper, GymEnvWrapper
 from metasim.sim.parallel import ParallelSimWrapper
 from metasim.types import Action
 from metasim.utils.state import CameraState, ObjectState, RobotState, TensorState
+
+from .mujoco_querier import MujocoQuerier
 
 
 class MujocoHandler(BaseSimHandler):
@@ -58,6 +55,7 @@ class MujocoHandler(BaseSimHandler):
         self._effort_controlled_joints = []
         self._position_controlled_joints = []
         self._current_action = None
+        self._current_vel_target = None  # Track velocity targets
 
     def launch(self) -> None:
         model = self._init_mujoco()
@@ -120,6 +118,7 @@ class MujocoHandler(BaseSimHandler):
                 raise ValueError
 
         self._robot_default_dof_pos = np.array(default_dof_pos)
+        self._current_vel_target = None  # Initialize velocity target tracking
 
     def _apply_scale_to_mjcf(self, mjcf_model, scale):
         """Apply scale to all geoms, bodies, and sites in the MJCF model."""
@@ -174,6 +173,18 @@ class MujocoHandler(BaseSimHandler):
                 if len(pos) >= 3:
                     joint.pos = [pos[0] * scale_x, pos[1] * scale_y, pos[2] * scale_z]
 
+    def _set_framebuffer_size(self, mjcf_model, width, height):
+        visual_elem = mjcf_model.visual
+        global_elem = None
+        for child in visual_elem._children:
+            if child.tag == "global":
+                global_elem = child
+                break
+        if global_elem is None:
+            global_elem = visual_elem.add("global")
+        global_elem.offwidth = width
+        global_elem.offheight = height
+
     def _create_primitive_xml(self, obj):
         if isinstance(obj, PrimitiveCubeCfg):
             size_str = f"{obj.half_size[0]} {obj.half_size[1]} {obj.half_size[2]}"
@@ -227,11 +238,13 @@ class MujocoHandler(BaseSimHandler):
                 "mode": "fixed",
                 "fovy": camera.vertical_fov,
                 "xyaxes": f"{right[0]} {right[1]} {right[2]} {up[0]} {up[1]} {up[2]}",
-                "resolution": f"{camera.width} {camera.height}",
             }
             mjcf_model.worldbody.add("camera", name=f"{camera.name}_custom", **camera_params)
             camera_max_width = max(camera_max_width, camera.width)
             camera_max_height = max(camera_max_height, camera.height)
+
+        if camera_max_width > 640 or camera_max_height > 480:
+            self._set_framebuffer_size(mjcf_model, camera_max_width, camera_max_height)
 
         if self.scenario.try_add_table:
             mjcf_model.asset.add(
@@ -388,7 +401,9 @@ class MujocoHandler(BaseSimHandler):
                     self.physics.data.joint(f"{model_name}/{jn}").qvel.item() for jn in joint_names
                 ]).unsqueeze(0),
                 joint_pos_target=torch.from_numpy(self.physics.data.ctrl[actuator_reindex]).unsqueeze(0),
-                joint_vel_target=None,  # TODO
+                joint_vel_target=torch.from_numpy(self._current_vel_target).unsqueeze(0)
+                if self._current_vel_target is not None
+                else None,
                 joint_effort_target=torch.from_numpy(self.physics.data.actuator_force[actuator_reindex]).unsqueeze(0),
             )
             robot_states[robot.name] = state
@@ -405,8 +420,9 @@ class MujocoHandler(BaseSimHandler):
                 depth = torch.from_numpy(depth.copy()).unsqueeze(0)
             state = CameraState(rgb=rgb, depth=depth)
             camera_states[camera.name] = state
+        extras = self.get_extra()
 
-        return TensorState(objects=object_states, robots=robot_states, cameras=camera_states, sensors={})
+        return TensorState(objects=object_states, robots=robot_states, cameras=camera_states, sensors={}, extras=extras)
 
     def _set_root_state(self, obj_name, obj_state, zero_vel=False):
         """Set root position and rotation."""
@@ -468,6 +484,9 @@ class MujocoHandler(BaseSimHandler):
             self._set_joint_state(obj_name, obj_state, zero_vel)
         self.physics.forward()
 
+    def get_extra(self):
+        return {k: MujocoQuerier.query(v, self) for k, v in (self.spec or {}).items() if v is not None}
+
     def _disable_robotgravity(self):
         gravity_vec = np.array([0.0, 0.0, -9.81])
 
@@ -513,6 +532,17 @@ class MujocoHandler(BaseSimHandler):
 
     def set_dof_targets(self, obj_name: str, actions: list[Action]) -> None:
         self._actions_cache = actions
+
+        # Extract velocity targets if present
+        vel_targets = actions[0][obj_name].get("dof_vel_target", None)
+        if vel_targets:
+            joint_names = self.get_joint_names(self.robot.name, sort=True)
+            self._current_vel_target = np.zeros(self._robot_num_dof)
+            for i, joint_name in enumerate(joint_names):
+                if joint_name in vel_targets:
+                    self._current_vel_target[i] = vel_targets[joint_name]
+        else:
+            self._current_vel_target = None
 
         if self._manual_pd_on:
             joint_targets = actions[0][obj_name]["dof_pos_target"]
@@ -606,10 +636,18 @@ class MujocoHandler(BaseSimHandler):
                 if joint_name:
                     robot_actuator_names.append(joint_name)
 
-        joint_names = self.get_joint_names(robot_name)
-        assert set(robot_actuator_names) == set(joint_names), (
-            f"Actuator names {robot_actuator_names} do not match joint names {joint_names}"
+        all_joint_names = self.get_joint_names(robot_name)
+
+        actuated_joint_names = []
+        for joint_name in all_joint_names:
+            if joint_name in self.robot.actuators:
+                if self.robot.actuators[joint_name].fully_actuated is not False:
+                    actuated_joint_names.append(joint_name)
+
+        assert set(robot_actuator_names) == set(actuated_joint_names), (
+            f"Actuator names {robot_actuator_names} do not match joint names {actuated_joint_names}"
         )
+
         return robot_actuator_names
 
     def _get_actuator_reindex(self, robot_name: str) -> list[int]:
